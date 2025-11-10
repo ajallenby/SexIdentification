@@ -24,9 +24,9 @@ ui <- fluidPage(
       fileInput("table1", label = h5("Peptide Intensities Data")),
       fileInput("table2", label = h5("Experimental Design")),
       tags$h5("Filtering parameters:"),
-      numericInput("dotProduct", "Library Dot Product", value = 0.9, min = 0, max = 1, step = 0.01),
-      numericInput("isotopeDotProduct", "Isotope Dot Product", value = 0.9, min = 0, max = 1, step = 0.01),
-      numericInput("peakFoundRatio", "Peptide Peak Found Ratio", value = 0.9, min = 0, max = 1, step = 0.01),
+      numericInput("dotProduct", "Library Dot Product", value = 0.9, min = 0, max = 1, step = 0.05),
+      numericInput("isotopeDotProduct", "Isotope Dot Product", value = 0.9, min = 0, max = 1, step = 0.05),
+      numericInput("peakFoundRatio", "Peptide Peak Found Ratio", value = 0.9, min = 0, max = 1, step = 0.05),
       actionButton("stdcurvesButton", "Plot STD curves")
     ),
     wellPanel(
@@ -580,6 +580,7 @@ server <- (function(input, output, session) {
   Sex_IDENTIFICATION <- function(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio){ 
     TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio)
     STD <- STD_Table(TableF) #filter the table to only have STD
+    Reg <- STD_Regression(STD) #calculate LOD and LOQ per peptide and store the values in Reg
     ID_Male <- Male_ID(TableF, Reg) #Obtain male identification
     if (x == 1) { #1="Experimental_model" 
       AMELYTh <- Male_model(ID_Male, a)
