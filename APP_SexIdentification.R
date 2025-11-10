@@ -23,7 +23,10 @@ ui <- fluidPage(
       tags$h4("Upload your data:"),
       fileInput("table1", label = h5("Peptide Intensities Data")),
       fileInput("table2", label = h5("Experimental Design")),
-      #here i also have a table
+      tags$h5("Filtering parameters:"),
+      numericInput("dotProduct", "Library Dot Product", value = 0.9, min = 0, max = 1, step = 0.01),
+      numericInput("isotopeDotProduct", "Isotope Dot Product", value = 0.9, min = 0, max = 1, step = 0.01),
+      numericInput("peakFoundRatio", "Peptide Peak Found Ratio", value = 0.9, min = 0, max = 1, step = 0.01),
       actionButton("stdcurvesButton", "Plot STD curves")
     ),
     wellPanel(
@@ -90,24 +93,25 @@ server <- (function(input, output, session) {
                "Peptide Modified Sequence", "File Name", "Sample Type", "Analyte Concentration", "Concentration Multiplier")
     Col_Names <- colnames(Table)
     ifelse(identical(Names,Col_Names) == FALSE, stop("Error"), "")
+    print(Table)
     return(Table)
   }
   
   #2. Filter peptide intensity table based on idopt, dopt and ppfr - (dt = Table)
-  Filter <- function(dt) {
+  Filter <- function(dt, dotProd, isoDotProd, peakRatio) {
     dt$`Analyte Concentration` <-dt$`Analyte Concentration`*dt$`Concentration Multiplier`
-    dt <- dt[dt$`Library Dot Product` >= 0.9,]
-    dt <- dt[dt$`Isotope Dot Product` >= 0.9,]
-    dt <- dt[dt$`Peptide Peak Found Ratio` >= 0.9,]
+    dt <- dt[dt$`Library Dot Product` >= dotProd,]
+    dt <- dt[dt$`Isotope Dot Product` >= isoDotProd,]
+    dt <- dt[dt$`Peptide Peak Found Ratio` >= peakRatio,]
     return(dt)
   }
   
   #3. Load and filter tables -  (fn1 = Experimental design, fn2 = Peptide intensities)
-  Load_Filter <- function (fn1, fn2) {
+  Load_Filter <- function (fn1, fn2, dotProd, isoDotProd, peakRatio) {
     ExpDesign <- load_ExpDesign(fn2)
     Table <- load_table(fn1)
     Table <- inner_join(Table, ExpDesign , by="File Name", relationship = "many-to-many")
-    TableF <- Filter(Table) #Filter table based on PPFR, IDOP, DOP
+    TableF <- Filter(Table, dotProd, isoDotProd, peakRatio) #Filter table based on PPFR, IDOP, DOP
     return(TableF)
   }
   
@@ -194,40 +198,77 @@ server <- (function(input, output, session) {
   #Input: Filtered intensity table, Table with regression coefficients from the standards. Output: Table annotated with samples identified as males. 
   Male_ID <- function(dt1, dt2){
     Sample <- dt1[dt1$`Sample Type` == "Unknown",]
-    NewTable <- data.table(Replicate = character(), SIRPPYPSY = numeric(), SIRPPYPSYG = numeric(), `SM[+16]IRPPY` = numeric(), `SM[+16]IRPPYS` = numeric(), SMIRPPY = numeric(), AMELX = numeric(), AMELY = numeric(), Experiment = character())
-    for (i in 1:length(unique(unlist(dt1[,Experiment])))) {
-      data <- Sample[Sample$Experiment == unique(unlist(dt1[,Experiment]))[i], ]
-      Stat <- dt2[dt2$Experiment == unique(unlist(dt1[,Experiment]))[i], ]
+    NewTable <- data.table()
+    
+    # Loop through each experiment safely
+    for (exp in unique(Sample$Experiment)) {
+      data <- Sample[Sample$Experiment == exp, ]
+      Stat <- dt2[dt2$Experiment == exp, ] # This will be an empty table if no standards for this exp
+      
       datawide <- LOQ_filter(data, Stat)
-      datawide <- datawide[, Experiment := unique(unlist(Sample[,Experiment]))[i]]
-      NewTable <- rbind(NewTable, datawide)
+      
+      if(nrow(datawide) > 0) {
+        datawide[, Experiment := exp]
+        NewTable <- rbind(NewTable, datawide, fill = TRUE)
+      }
     }
-    #Add sex identification
-    NewTable[, Sex := fifelse(AMELY == "0", "Unknown", 
-                              fifelse(AMELX == "0", "NonConclusive", "Male"))]
+    
+    # Handle case where NewTable is completely empty
+    if(nrow(NewTable) == 0) {
+      return(data.table(Replicate = character(), AMELX = numeric(), AMELY = numeric(), Sex = character()))
+    }
+    
+    # Add sex identification
+    # Ensure AMELX and AMELY columns exist to avoid errors
+    if (!"AMELY" %in% names(NewTable)) NewTable[, AMELY := 0]
+    if (!"AMELX" %in% names(NewTable)) NewTable[, AMELX := 0]
+    
+    NewTable[, Sex := fifelse(AMELY == 0, "Unknown", 
+                              fifelse(AMELX == 0, "NonConclusive", "Male"))]
     return(NewTable)
   }
   
- #8.2. Filter out values that are < LOQ per target for a given experiment 
+  #8.2. Filter out values that are < LOQ per target for a given experiment 
   LOQ_filter <- function(data, Stat){
-    data <- data [, c("Replicate", "Peptide Modified Sequence", "Normalized Area")]
+    data <- data[, c("Replicate", "Peptide Modified Sequence", "Normalized Area")]
     data <- na.omit(data)
+    
+    if (nrow(data) == 0) {
+      return(data.table(Replicate=character(), AMELX=numeric(), AMELY=numeric()))
+    }
+    
     datawide <- as.data.table(spread(data, "Peptide Modified Sequence", "Normalized Area"))
-    LOQI1 <- as.numeric(Stat[1,6])
-    LOQI2 <- as.numeric(Stat[2,6])
-    LOQI3 <- as.numeric(Stat[3,6])
-    LOQI4 <- as.numeric(Stat[4,6])
-    LOQI5 <- as.numeric(Stat[5,6])
-    datawide$SIRPPYPSY[datawide$SIRPPYPSY < LOQI1] <- 0
-    datawide$SIRPPYPSYG[datawide$SIRPPYPSYG < LOQI2] <- 0
-    datawide$`SM[+16]IRPPY`[datawide$`SM[+16]IRPPY` < LOQI3] <- 0
-    datawide$`SM[+16]IRPPYS`[datawide$`SM[+16]IRPPYS` < LOQI4] <- 0
-    datawide$SMIRPPY[datawide$SMIRPPY < LOQI5] <- 0
-    datawide <- as.data.table(datawide)
-    #Turns NA into 0
-    datawide[is.na(datawide)] <- 0
-    datawide[, AMELX := SIRPPYPSY + SIRPPYPSYG]
-    datawide[, AMELY := `SM[+16]IRPPY` + `SM[+16]IRPPYS` + SMIRPPY]
+    
+    # Create a named vector for LOQs for easy and safe lookup.
+    # If Stat is empty or has no LOQ column, this will be an empty named vector.
+    loq_lookup <- if(nrow(Stat) > 0 && "LOQ" %in% names(Stat)) setNames(Stat$LOQ, Stat$Sequence) else setNames(numeric(), character())
+    
+    # Helper function to get LOQ for a peptide, defaulting to 0 if not found.
+    # A LOQ of 0 means the filter will never be applied if the standard is missing.
+    get_loq <- function(peptide_name) {
+      val <- loq_lookup[peptide_name]
+      if (is.na(val) || is.null(val)) 0 else val
+    }
+    
+    # Apply filter if the column exists
+    if ("SIRPPYPSY" %in% names(datawide)) datawide$SIRPPYPSY[datawide$SIRPPYPSY < get_loq("SIRPPYPSY")] <- 0
+    if ("SIRPPYPSYG" %in% names(datawide)) datawide$SIRPPYPSYG[datawide$SIRPPYPSYG < get_loq("SIRPPYPSYG")] <- 0
+    if ("SM[+16]IRPPY" %in% names(datawide)) datawide$`SM[+16]IRPPY`[datawide$`SM[+16]IRPPY` < get_loq("SM[+16]IRPPY")] <- 0
+    if ("SM[+16]IRPPYS" %in% names(datawide)) datawide$`SM[+16]IRPPYS`[datawide$`SM[+16]IRPPYS` < get_loq("SM[+16]IRPPYS")] <- 0
+    if ("SMIRPPY" %in% names(datawide)) datawide$SMIRPPY[datawide$SMIRPPY < get_loq("SMIRPPY")] <- 0
+    
+    # Turns NA into 0 for all columns
+    for (j in seq_along(datawide)) {
+      set(datawide, which(is.na(datawide[[j]])), j, 0)
+    }
+    
+    # Summing up peptides. Checks if columns exist before summing.
+    amelx_peps <- c("SIRPPYPSY", "SIRPPYPSYG")
+    amely_peps <- c("SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY")
+    
+    datawide[, AMELX := rowSums(.SD, na.rm = TRUE), .SDcols = intersect(amelx_peps, names(datawide))]
+    datawide[, AMELY := rowSums(.SD, na.rm = TRUE), .SDcols = intersect(amely_peps, names(datawide))]
+    
     return(datawide)
   }
   
@@ -294,18 +335,37 @@ server <- (function(input, output, session) {
   Female_ID <- function(dt1, dt2){
     STD <- STD_Table(dt2)
     Reg <- STD_Regression(STD)
-    ID <- data.table(Replicate = character(), SIRPPYPSY = numeric(), SIRPPYPSYG = numeric(), `SM[+16]IRPPY` = numeric(), `SM[+16]IRPPYS` = numeric(), 
-                     SMIRPPY = numeric(), AMELX = numeric(), AMELY = numeric(), Experiment = character(), Sex = character(), ThAMELY = numeric(), 
-                     AMELY_low = numeric(), AMELY_high = numeric(), Females = character())
-    for (i in 1:length(unique(unlist(dt2[,Experiment])))) {
-      Reg2 <- Reg[Reg$Experiment == unique(unlist(dt2[,Experiment]))[i], ]
-      Table <- dt1[dt1$Experiment == unique(unlist(dt2[,Experiment]))[i]]
-      LOD_AMELX <- max(as.numeric(Reg[1, 5]), as.numeric(Reg[2, 5]))
-      LOD_AMELY <- max(as.numeric(Reg[3, 5]) , as.numeric(Reg[4, 5]))
-      LOQ_AMELX <- max(as.numeric(Reg[1,6]), as.numeric(Reg[2,6]))
-      LOQ_AMELY <- max(as.numeric(Reg[3,6]), as.numeric(Reg[4,6]))
-      Table <- Table [, Females := fifelse(ThAMELY > log(LOQ_AMELY, 2)  & AMELY_low > log(LOD_AMELY, 2), "Female", "NonConclusive")]
-      ID <- rbind(ID, Table)
+    ID <- data.table() # Initialize an empty data.table
+    
+    # A small helper function to safely get max value, returns -Inf if no peptides are found
+    safe_max <- function(values) {
+      if (length(values) == 0 || all(is.na(values))) return(-Inf)
+      max(values, na.rm = TRUE)
+    }
+    
+    for (exp in unique(dt2$Experiment)) {
+      Reg2 <- Reg[Reg$Experiment == exp, ]
+      Table <- dt1[dt1$Experiment == exp, ]
+      
+      # If there's no regression data for this experiment, mark all as NonConclusive
+      if (nrow(Reg2) == 0) {
+        Table[, Females := "NonConclusive"]
+        ID <- rbind(ID, Table, fill = TRUE) # Use fill=TRUE to handle potential column mismatches
+        next # Skip to the next iteration of the loop
+      }
+      
+      # Robustly find LOD and LOQ by peptide name
+      LOD_AMELY_val <- safe_max(Reg2[Sequence %in% c("SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY"), LOD])
+      LOQ_AMELY_val <- safe_max(Reg2[Sequence %in% c("SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY"), LOQ])
+      
+      # Apply the logic
+      Table[, Females := fifelse(ThAMELY > log(LOQ_AMELY_val, 2) & AMELY_low > log(LOD_AMELY_val, 2), "Female", "NonConclusive")]
+      ID <- rbind(ID, Table, fill = TRUE)
+    }
+    # Ensure the final columns match the expected output, filling missing ones with NA
+    # This prevents errors if 'Females' column isn't created in some loops
+    if (!"Females" %in% names(ID)) {
+      ID[, Females := NA_character_]
     }
     return(ID)
   }
@@ -389,12 +449,11 @@ server <- (function(input, output, session) {
   
   #####TAB 2 - SEX IDENTIFICATION#############################
   
-  #Function for the experimental based Male model - (fn1 = Peptide intensities data, fn2 = Experimental design, x = Choice of the modeling strategy, a = max % of values to be removed)
-  Plots1 <- function(fn1, fn2, x, a){
-    SUMMARY<-Sex_IDENTIFICATION(fn1, fn2, x, a)
-    p1 <- ggplot(SUMMARY, aes(x= AMELX, y=AMELY, 2))+
+  #Function for the experimental based Male model - (SUMMARY = result from Sex_IDENTIFICATION, TableF = filtered data, a = outlier %)
+  Plots1 <- function(SUMMARY, TableF, a){
+    p1 <- ggplot(SUMMARY, aes(x= AMELX, y=AMELY))+
       geom_point(size=3, aes(col=Sex))+
-      scale_color_manual(values = c("#ffb627", "#60d394", "#ee6055"))+
+      scale_color_manual(values = c("Female" = "#ffb627", "Male" = "#60d394", "NonConclusive" = "#ee6055", "Unknown" = "grey"))+
       theme_light()+
       geom_text_repel(aes(label= Sample),hjust = 0.5, vjust= -1, size= 4)+
       ggtitle("Summary")+
@@ -405,10 +464,9 @@ server <- (function(input, output, session) {
         axis.text = element_text(size = 11),
         legend.text = element_text(size = 13))+
       labs(color=NULL)
-    TableF <- Load_Filter(fn1, fn2)
-    STD <- STD_Table(TableF) #filter the table to only have STD
-    Reg <- STD_Regression(STD) #calculate LOD and LOQ per peptide and store the values in Reg
-    ID_Male <- Male_ID(TableF, Reg) #Obtain male identification
+    STD <- STD_Table(TableF)
+    Reg <- STD_Regression(STD)
+    ID_Male <- Male_ID(TableF, Reg)
     Males <- ID_Male[Sex == "Male", ]
     regressions_data2 <- Regression2(Males, a)
     FilteredMale <- as.data.table(regressions_data2$FilteredData)
@@ -441,11 +499,11 @@ server <- (function(input, output, session) {
   }
   
   #Function for the predefined Male model - (fn1 = Peptide intensities data, fn2 = Experimental design, x = Choice of the modeling strategy)
-  Plots2 <- function(fn1, fn2, x, a){
-    SUMMARY<-Sex_IDENTIFICATION(fn1, fn2, x, a)
+  #Function for the predefined Male model - (SUMMARY = result from Sex_IDENTIFICATION)
+  Plots2 <- function(SUMMARY){
     p1 <- ggplot(SUMMARY, aes(x= AMELX, y=AMELY))+
       geom_point(size=3, aes(col=Sex))+
-      scale_color_manual(values = c("#ffb627", "#60d394", "#ee6055"))+
+      scale_color_manual(values = c("Female" = "#ffb627", "Male" = "#60d394", "NonConclusive" = "#ee6055", "Unknown" = "grey"))+
       theme_light()+
       geom_text_repel(aes(label= Sample),hjust = 0.5, vjust= -1, size= 4)+
       ggtitle("Summary")+
@@ -493,31 +551,35 @@ server <- (function(input, output, session) {
   
   ##############################MAIN FUNCTIONS###############################################
   
-#A. Plot the standard curves per experiment per target in tab 1 - (fn1 = peptide intensity data, fn2 = experimental design)
-  PlotStdCurves <- function(fn1, fn2){
-    TableF <- Load_Filter(fn1, fn2)
+  #A. Plot the standard curves per experiment per target in tab 1 - (fn1 = peptide intensity data, fn2 = experimental design)
+  PlotStdCurves <- function(fn1, fn2, dotProd, isoDotProd, peakRatio){
+    TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio)
     STD <- STD_Table(TableF)
     Reg <- STD_Regression(STD)
     STD_Plot(STD, Reg) #Plot std curves
   }
   
  
-#B. Plot the overview of the AMELX and AMELY intensities per samples and the model in tab 2 - (fn1 = peptide intensity data, fn2 = experimental design, x = Choice of the modeling strategy, a = max % of values to be removed)
-  Plot_Tab2 <- function(fn1, fn2,  x, a){ #x=function selected in the radio buttons?
+  #B. Plot the overview of the AMELX and AMELY intensities per samples and the model in tab 2 - (fn1 = peptide intensity data, fn2 = experimental design, x = Choice of the modeling strategy, a = max % of values to be removed)
+  Plot_Tab2 <- function(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio){
+    # We need to update the calls to Plots1 and Plots2 inside this function as well.
+    # To do that, we'll pass the filtering parameters to the Sex_IDENTIFICATION function they call.
+    SUMMARY <- Sex_IDENTIFICATION(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio)
     if (x == 1) {
-      return(Plots1(fn1, fn2, x, a))
+      # Since Plots1 calls Load_Filter again, we must update its definition and call.
+      TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio)
+      Plots1(SUMMARY, TableF, a)
     }
     else if(x == 2){
-      return(Plots2(fn1, fn2, x, a))
+      Plots2(SUMMARY)
     }
   }
   
  
-#C. Obtain sex identification table starting from the inputs and generate a summary table in tab 2 - (fn1 = Peptide intensities data, fn2 = Experimental design, x = Choice of the modeling strategy, a = max % of values to be removed)
-  Sex_IDENTIFICATION <- function(fn1, fn2, x, a){ 
-    TableF <- Load_Filter(fn1, fn2)
+  #C. Obtain sex identification table starting from the inputs and generate a summary table in tab 2 - (fn1 = Peptide intensities data, fn2 = Experimental design, x = Choice of the modeling strategy, a = max % of values to be removed)
+  Sex_IDENTIFICATION <- function(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio){ 
+    TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio)
     STD <- STD_Table(TableF) #filter the table to only have STD
-    Reg <- STD_Regression(STD) #calculate LOD and LOQ per peptide and store the values in Reg
     ID_Male <- Male_ID(TableF, Reg) #Obtain male identification
     if (x == 1) { #1="Experimental_model" 
       AMELYTh <- Male_model(ID_Male, a)
@@ -531,9 +593,9 @@ server <- (function(input, output, session) {
   }
   
   
-#D. Plot the MS traces in tab 3 -  (fn1 = Peptide intensities data, fn2 = Experimental design, fn3 = Raw intensities data, x = replicate, y = Choice of the modeling strategy, a = max % of values to be removed) 
-  Plot_MSTraces <- function(fn1, fn2, fn3, x, y, a){ 
-    SUMMARY <- Sex_IDENTIFICATION(fn1, fn2, y, a)
+  #D. Plot the MS traces in tab 3 -  (fn1 = Peptide intensities data, fn2 = Experimental design, fn3 = Raw intensities data, x = replicate, y = Choice of the modeling strategy, a = max % of values to be removed) 
+  Plot_MSTraces <- function(fn1, fn2, fn3, x, y, a, dotProd, isoDotProd, peakRatio){ 
+    SUMMARY <- Sex_IDENTIFICATION(fn1, fn2, y, a, dotProd, isoDotProd, peakRatio)
     Table <- fread(fn3)
     TableF <- Table[!grepl("precursor", Table$Transition),]
     #Filter to only keep one sample
@@ -610,47 +672,41 @@ server <- (function(input, output, session) {
   })
   
   x <- eventReactive(input$stdcurvesButton, {
-    inFile_1 <- input$table1
-    inFile_2 <- input$table2
-    PlotStdCurves(inFile_1$datapath, inFile_2$datapath)
+    req(input$table1, input$table2)
+    PlotStdCurves(input$table1$datapath, input$table2$datapath, 
+                  input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
   })
   
   v <- eventReactive(input$modelButton, {
-    inFile_1 <- input$table1
-    inFile_2 <- input$table2
-    y=input$model
-    a=input$outlier
-    Plot_Tab2(inFile_1$datapath, inFile_2$datapath, y, a)
+    req(input$table1, input$table2)
+    Plot_Tab2(input$table1$datapath, input$table2$datapath, 
+              input$model, input$outlier,
+              input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
   })
   
   y <- eventReactive(input$sexidButton, {
-    inFile_1 <- input$table1
-    inFile_2 <- input$table2
-    y=input$model
-    a=input$outlier
-    Sex_IDENTIFICATION(inFile_1$datapath, inFile_2$datapath, y, a)
+    req(input$table1, input$table2)
+    Sex_IDENTIFICATION(input$table1$datapath, input$table2$datapath, 
+                       input$model, input$outlier,
+                       input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
   })
   
   output$download <- downloadHandler(
     filename = function() {"sex_identification_output.csv"},
     content = function(file) {
-      inFile_1 <- input$table1
-      inFile_2 <- input$table2
-      y = input$model
-      a=input$outlier
-      result <- Sex_IDENTIFICATION(inFile_1$datapath, inFile_2$datapath, y, a)
-      write.csv(result, file)
+      req(input$table1, input$table2)
+      result <- Sex_IDENTIFICATION(input$table1$datapath, input$table2$datapath, 
+                                   input$model, input$outlier,
+                                   input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
+      write.csv(result, file, row.names = FALSE)
     }
   )
   
   z <- eventReactive(input$tracesButton, {
-    inFile_1 <- input$table1
-    inFile_2 <- input$table2
-    inFile_3 <- input$skyline
-    sample<-input$samples
-    y=input$model
-    a=input$outlier
-    Plot_MSTraces(inFile_1$datapath, inFile_2$datapath, inFile_3$datapath, sample, y, a)
+    req(input$table1, input$table2, input$skyline)
+    Plot_MSTraces(input$table1$datapath, input$table2$datapath, input$skyline$datapath, 
+                  input$samples, input$model, input$outlier,
+                  input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
   })
   
   output$plot1 <- renderPlot({x()})
