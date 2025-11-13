@@ -16,6 +16,41 @@ library(ggrepel) #version 0.9.3
 
 ui <- fluidPage(
   
+  tags$head(
+    tags$style(HTML("
+      /* Style for the 'Advanced Settings' collapsible section */
+      details {
+        margin-bottom: 15px; /* Adds space between the section and the button below */
+        border: 1px solid #ddd;
+        border-radius: 4px;
+        padding: 5px;
+      }
+      
+      summary {
+        cursor: pointer; /* Changes the cursor to a hand pointer */
+        font-weight: bold;
+        color: #007bff; /* Makes the text look like a hyperlink */
+        outline: none; /* Removes the default focus outline */
+      }
+      
+      summary:hover {
+        text-decoration: underline;
+      }
+      
+      /* Add a right-pointing arrow by default */
+      summary::before {
+        content: '► '; /* Unicode for a right-pointing triangle */
+        font-size: 0.9em;
+        margin-right: 4px;
+      }
+      
+      /* Change the arrow to point down when the section is open */
+      details[open] > summary::before {
+        content: '▼ '; /* Unicode for a down-pointing triangle */
+      }
+    "))
+  ),
+  
   titlePanel("Sex Identification"),
   
   sidebarPanel(
@@ -23,10 +58,24 @@ ui <- fluidPage(
       tags$h4("Upload your data:"),
       fileInput("table1", label = h5("Peptide Intensities Data")),
       fileInput("table2", label = h5("Experimental Design")),
-      tags$h5("Filtering parameters:"),
-      numericInput("dotProduct", "Library Dot Product", value = 0.9, min = 0, max = 1, step = 0.05),
-      numericInput("isotopeDotProduct", "Isotope Dot Product", value = 0.9, min = 0, max = 1, step = 0.05),
-      numericInput("peakFoundRatio", "Peptide Peak Found Ratio", value = 0.9, min = 0, max = 1, step = 0.05),
+      # Collapsible Advanced Settings section
+      tags$details(
+        tags$summary("Advanced Settings"),
+        wellPanel(
+          style = "margin-top: 10px;", # Adds a little space
+          tags$h5("Filtering parameters:"),
+          numericInput("dotProduct", "Library Dot Product", value = 0.9, min = 0, max = 1, step = 0.05),
+          numericInput("isotopeDotProduct", "Isotope Dot Product", value = 0.9, min = 0, max = 1, step = 0.05),
+          numericInput("peakFoundRatio", "Peptide Peak Found Ratio", value = 0.9, min = 0, max = 1, step = 0.05),
+          tags$h5("LOD/LOQ parameters:"),
+          numericInput("lod_coeff", "LOD Coefficient", value = 3.3, min = 0, step = 0.1),
+          numericInput("loq_coeff", "LOQ Coefficient", value = 10, min = 0, step = 0.5),
+          tags$h5("Peptide selection:"),
+          checkboxGroupInput("peptide_selection", "Include peptides in analysis:",
+                             choices = c("SIRPPYPSY", "SIRPPYPSYG", "SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY"),
+                             selected = c("SIRPPYPSY", "SIRPPYPSYG", "SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY"))
+        )
+      ),
       actionButton("stdcurvesButton", "Plot STD curves")
     ),
     wellPanel(
@@ -93,7 +142,6 @@ server <- (function(input, output, session) {
                "Peptide Modified Sequence", "File Name", "Sample Type", "Analyte Concentration", "Concentration Multiplier")
     Col_Names <- colnames(Table)
     ifelse(identical(Names,Col_Names) == FALSE, stop("Error"), "")
-    print(Table)
     return(Table)
   }
   
@@ -107,10 +155,12 @@ server <- (function(input, output, session) {
   }
   
   #3. Load and filter tables -  (fn1 = Experimental design, fn2 = Peptide intensities)
-  Load_Filter <- function (fn1, fn2, dotProd, isoDotProd, peakRatio) {
+  Load_Filter <- function (fn1, fn2, dotProd, isoDotProd, peakRatio, selectedPeptides) {
     ExpDesign <- load_ExpDesign(fn2)
     Table <- load_table(fn1)
     Table <- inner_join(Table, ExpDesign , by="File Name", relationship = "many-to-many")
+    # First, filter by selected peptides
+    Table <- Table[Table$`Peptide Modified Sequence` %in% selectedPeptides, ]
     TableF <- Filter(Table, dotProd, isoDotProd, peakRatio) #Filter table based on PPFR, IDOP, DOP
     return(TableF)
   }
@@ -139,24 +189,24 @@ server <- (function(input, output, session) {
   
   #5. Regression - Perform linear regression and store the relevant coefficients - (dt = Table_i) 
   #Input: Table with standards for 1 experiment. Output: list with regression coefficients
-  Regression <- function(dt) {
+  Regression <- function(dt, lod_coeff, loq_coeff) {
     Reg <-lm(dt$`Analyte Concentration` ~ dt$`Normalized Area`, data = dt)
     Slope <- round(coef(Reg)[2], 15)
     Intercept <- round(coef(Reg)[1], 3)
     R2 <- round(as.numeric(summary(Reg)[8]), 3)
     SDy <- as.numeric(summary(Reg)[["coefficients"]][1,2])
-    LOD <- (3.3 * SDy) / Slope
-    LOQ <- (10 * SDy) / Slope
+    LOD <- (lod_coeff * SDy) / Slope
+    LOQ <- (loq_coeff * SDy) / Slope
     c(Slope, Intercept, R2, LOD, LOQ)
   }
   
   #6. Perform regression on the Std - (dt = STD)
   #Input: Table with STD . Output: Table with regression values
-  STD_Regression <- function(dt){
+  STD_Regression <- function(dt, lod_coeff, loq_coeff){
     Reg <- data.table(Sequence = character(), Slope = numeric(), Intercept = numeric(), R2 = numeric(), LOD = numeric(), LOQ = numeric(), Experiment = character())
     for (i in 1:length(unique(unlist(dt[,Experiment])))) {
       Table_i <- dt[Experiment == unique(unlist(dt[,Experiment]))[i], ]
-      regressions_data <- as.data.table(plyr::ddply(Table_i, "Sequence", Regression))
+      regressions_data <- as.data.table(plyr::ddply(Table_i, "Sequence", Regression, lod_coeff = lod_coeff, loq_coeff = loq_coeff))
       regressions_data <- regressions_data[, Experiment := unique(unlist(dt[,Experiment]))[i]]
       colnames(regressions_data) <-
         c ("Sequence", "Slope", "Intercept", "R2", "LOD", "LOQ", "Experiment")
@@ -228,46 +278,41 @@ server <- (function(input, output, session) {
     return(NewTable)
   }
   
-  #8.2. Filter out values that are < LOQ per target for a given experiment 
+  #8.2. Filter out values that are < LOQ per target for a given experiment
   LOQ_filter <- function(data, Stat){
-    data <- data[, c("Replicate", "Peptide Modified Sequence", "Normalized Area")]
+    data <- data [, c("Replicate", "Peptide Modified Sequence", "Normalized Area")]
     data <- na.omit(data)
+
+    # Safely merge with stats to get LOQ for each peptide, then filter.
+    # We use by.x and by.y to avoid renaming the original 'Stat' object.
+    data_with_loq <- merge(data, Stat, by.x = "Peptide Modified Sequence", by.y = "Sequence")
+    data_with_loq[`Normalized Area` < LOQ, `Normalized Area` := 0]
     
-    if (nrow(data) == 0) {
-      return(data.table(Replicate=character(), AMELX=numeric(), AMELY=numeric()))
+    # Spread to wide format
+    datawide <- as.data.table(spread(data_with_loq[, c("Replicate", "Peptide Modified Sequence", "Normalized Area")], "Peptide Modified Sequence", "Normalized Area"))
+    datawide[is.na(datawide)] <- 0
+    
+    # Define which peptides belong to which protein
+    amelx_peptides <- c("SIRPPYPSY", "SIRPPYPSYG")
+    amely_peptides <- c("SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY")
+    
+    # Find which peptides are actually present in the data
+    present_amelx <- intersect(amelx_peptides, colnames(datawide))
+    present_amely <- intersect(amely_peptides, colnames(datawide))
+    
+    # Dynamically sum the present peptides for AMELX
+    if (length(present_amelx) > 0) {
+      datawide[, AMELX := rowSums(.SD, na.rm = TRUE), .SDcols = present_amelx]
+    } else {
+      datawide[, AMELX := 0]
     }
     
-    datawide <- as.data.table(spread(data, "Peptide Modified Sequence", "Normalized Area"))
-    
-    # Create a named vector for LOQs for easy and safe lookup.
-    # If Stat is empty or has no LOQ column, this will be an empty named vector.
-    loq_lookup <- if(nrow(Stat) > 0 && "LOQ" %in% names(Stat)) setNames(Stat$LOQ, Stat$Sequence) else setNames(numeric(), character())
-    
-    # Helper function to get LOQ for a peptide, defaulting to 0 if not found.
-    # A LOQ of 0 means the filter will never be applied if the standard is missing.
-    get_loq <- function(peptide_name) {
-      val <- loq_lookup[peptide_name]
-      if (is.na(val) || is.null(val)) 0 else val
+    # Dynamically sum the present peptides for AMELY
+    if (length(present_amely) > 0) {
+      datawide[, AMELY := rowSums(.SD, na.rm = TRUE), .SDcols = present_amely]
+    } else {
+      datawide[, AMELY := 0]
     }
-    
-    # Apply filter if the column exists
-    if ("SIRPPYPSY" %in% names(datawide)) datawide$SIRPPYPSY[datawide$SIRPPYPSY < get_loq("SIRPPYPSY")] <- 0
-    if ("SIRPPYPSYG" %in% names(datawide)) datawide$SIRPPYPSYG[datawide$SIRPPYPSYG < get_loq("SIRPPYPSYG")] <- 0
-    if ("SM[+16]IRPPY" %in% names(datawide)) datawide$`SM[+16]IRPPY`[datawide$`SM[+16]IRPPY` < get_loq("SM[+16]IRPPY")] <- 0
-    if ("SM[+16]IRPPYS" %in% names(datawide)) datawide$`SM[+16]IRPPYS`[datawide$`SM[+16]IRPPYS` < get_loq("SM[+16]IRPPYS")] <- 0
-    if ("SMIRPPY" %in% names(datawide)) datawide$SMIRPPY[datawide$SMIRPPY < get_loq("SMIRPPY")] <- 0
-    
-    # Turns NA into 0 for all columns
-    for (j in seq_along(datawide)) {
-      set(datawide, which(is.na(datawide[[j]])), j, 0)
-    }
-    
-    # Summing up peptides. Checks if columns exist before summing.
-    amelx_peps <- c("SIRPPYPSY", "SIRPPYPSYG")
-    amely_peps <- c("SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY")
-    
-    datawide[, AMELX := rowSums(.SD, na.rm = TRUE), .SDcols = intersect(amelx_peps, names(datawide))]
-    datawide[, AMELY := rowSums(.SD, na.rm = TRUE), .SDcols = intersect(amely_peps, names(datawide))]
     
     return(datawide)
   }
@@ -332,9 +377,9 @@ server <- (function(input, output, session) {
   
   #10. Get female identification - Confirm the female identification when ThAMELY fit predefined criteria. - (dt1 = AMELYTh , dt2 = TableF)
   #Input: Table with predicted AMELY intensities for potential females, Peptide intensities filtered table. Output: Table with female identification.
-  Female_ID <- function(dt1, dt2){
+  Female_ID <- function(dt1, dt2, lod_coeff, loq_coeff){
     STD <- STD_Table(dt2)
-    Reg <- STD_Regression(STD)
+    Reg <- STD_Regression(STD, lod_coeff, loq_coeff)
     ID <- data.table() # Initialize an empty data.table
     
     # A small helper function to safely get max value, returns -Inf if no peptides are found
@@ -342,6 +387,7 @@ server <- (function(input, output, session) {
       if (length(values) == 0 || all(is.na(values))) return(-Inf)
       max(values, na.rm = TRUE)
     }
+    print(Reg)
     
     for (exp in unique(dt2$Experiment)) {
       Reg2 <- Reg[Reg$Experiment == exp, ]
@@ -357,6 +403,10 @@ server <- (function(input, output, session) {
       # Robustly find LOD and LOQ by peptide name
       LOD_AMELY_val <- safe_max(Reg2[Sequence %in% c("SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY"), LOD])
       LOQ_AMELY_val <- safe_max(Reg2[Sequence %in% c("SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY"), LOQ])
+      
+      print(Table)
+      print(paste("LOD AMELY:",LOD_AMELY_val))
+      print(paste("LOQ AMELY:",LOQ_AMELY_val))
       
       # Apply the logic
       Table[, Females := fifelse(ThAMELY > log(LOQ_AMELY_val, 2) & AMELY_low > log(LOD_AMELY_val, 2), "Female", "NonConclusive")]
@@ -450,7 +500,7 @@ server <- (function(input, output, session) {
   #####TAB 2 - SEX IDENTIFICATION#############################
   
   #Function for the experimental based Male model - (SUMMARY = result from Sex_IDENTIFICATION, TableF = filtered data, a = outlier %)
-  Plots1 <- function(SUMMARY, TableF, a){
+  Plots1 <- function(SUMMARY, TableF, a, lod_coeff, loq_coeff){
     p1 <- ggplot(SUMMARY, aes(x= AMELX, y=AMELY))+
       geom_point(size=3, aes(col=Sex))+
       scale_color_manual(values = c("Female" = "#ffb627", "Male" = "#60d394", "NonConclusive" = "#ee6055", "Unknown" = "grey"))+
@@ -465,7 +515,7 @@ server <- (function(input, output, session) {
         legend.text = element_text(size = 13))+
       labs(color=NULL)
     STD <- STD_Table(TableF)
-    Reg <- STD_Regression(STD)
+    Reg <- STD_Regression(STD, lod_coeff, loq_coeff)
     ID_Male <- Male_ID(TableF, Reg)
     Males <- ID_Male[Sex == "Male", ]
     regressions_data2 <- Regression2(Males, a)
@@ -551,113 +601,129 @@ server <- (function(input, output, session) {
   
   ##############################MAIN FUNCTIONS###############################################
   
-  #A. Plot the standard curves per experiment per target in tab 1 - (fn1 = peptide intensity data, fn2 = experimental design)
-  PlotStdCurves <- function(fn1, fn2, dotProd, isoDotProd, peakRatio){
-    TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio)
+  #A. Plot the standard curves per experiment per target in tab 1
+  PlotStdCurves <- function(fn1, fn2, dotProd, isoDotProd, peakRatio, selectedPeptides, lod_coeff, loq_coeff){
+    TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio, selectedPeptides)
     STD <- STD_Table(TableF)
-    Reg <- STD_Regression(STD)
+    Reg <- STD_Regression(STD, lod_coeff, loq_coeff)
     STD_Plot(STD, Reg) #Plot std curves
   }
   
- 
-  #B. Plot the overview of the AMELX and AMELY intensities per samples and the model in tab 2 - (fn1 = peptide intensity data, fn2 = experimental design, x = Choice of the modeling strategy, a = max % of values to be removed)
-  Plot_Tab2 <- function(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio){
-    # We need to update the calls to Plots1 and Plots2 inside this function as well.
-    # To do that, we'll pass the filtering parameters to the Sex_IDENTIFICATION function they call.
-    SUMMARY <- Sex_IDENTIFICATION(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio)
+  #B. Plot the overview of the AMELX and AMELY intensities per samples and the model in tab 2
+  Plot_Tab2 <- function(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio, selectedPeptides, lod_coeff, loq_coeff){
+    SUMMARY <- Sex_IDENTIFICATION(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio, selectedPeptides, lod_coeff, loq_coeff)
+    TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio, selectedPeptides)
     if (x == 1) {
-      # Since Plots1 calls Load_Filter again, we must update its definition and call.
-      TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio)
-      Plots1(SUMMARY, TableF, a)
+      Plots1(SUMMARY, TableF, a, lod_coeff, loq_coeff)
     }
     else if(x == 2){
       Plots2(SUMMARY)
     }
   }
   
- 
-  #C. Obtain sex identification table starting from the inputs and generate a summary table in tab 2 - (fn1 = Peptide intensities data, fn2 = Experimental design, x = Choice of the modeling strategy, a = max % of values to be removed)
-  Sex_IDENTIFICATION <- function(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio){ 
-    TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio)
-    STD <- STD_Table(TableF) #filter the table to only have STD
-    Reg <- STD_Regression(STD) #calculate LOD and LOQ per peptide and store the values in Reg
-    ID_Male <- Male_ID(TableF, Reg) #Obtain male identification
-    if (x == 1) { #1="Experimental_model" 
+  #C. Obtain sex identification table starting from the inputs and generate a summary table in tab 2
+  Sex_IDENTIFICATION <- function(fn1, fn2, x, a, dotProd, isoDotProd, peakRatio, selectedPeptides, lod_coeff, loq_coeff){ 
+    
+    # Step 1: Get a master list of all samples BEFORE filtering
+    ExpDesign <- load_ExpDesign(fn2)
+    Table_unfiltered <- load_table(fn1)
+    Table_unfiltered <- inner_join(Table_unfiltered, ExpDesign , by="File Name", relationship = "many-to-many")
+    all_unknown_samples <- unique(Table_unfiltered[!`Sample Type` %in% c("Blank","Standard"),
+                                                   c("File Name", "Experiment", "Replicate")])
+    
+    # Step 2: Proceed with the original analysis pipeline
+    TableF <- Load_Filter(fn1, fn2, dotProd, isoDotProd, peakRatio, selectedPeptides)
+    
+    # Gracefully handle cases where all data is filtered out
+    if(nrow(TableF) == 0) {
+      all_unknown_samples[, AMELX := 0]
+      all_unknown_samples[, AMELY := 0]
+      all_unknown_samples[, Sex := "NonConclusive"]
+      return(all_unknown_samples)
+    }
+    
+    STD <- STD_Table(TableF)
+    Reg <- STD_Regression(STD, lod_coeff, loq_coeff)
+    ID_Male <- Male_ID(TableF, Reg)
+    
+    
+    if (x == 1) {
       AMELYTh <- Male_model(ID_Male, a)
     }
-    else if(x == 2){ #2="Predef_model"
+    else if(x == 2){
       AMELYTh <- Male_Predef_Model(ID_Male)
     }
-    ID_Female <- Female_ID(AMELYTh, TableF) #Obtain female ID
+    
+    ID_Female <- Female_ID(AMELYTh, TableF, lod_coeff, loq_coeff)
     Summary <- Summary_table(ID_Female, ID_Male)
-    return(Summary)
+    
+    
+    colnames(all_unknown_samples) <- c("File Name", "Experiment", "Sample")
+    
+    # Step 3: Merge the results back with the master list to re-introduce lost samples
+    Final_Summary <- merge(all_unknown_samples, Summary,
+                           by = c("Sample", "Experiment"), all.x = TRUE)
+    
+    # Step 4: Clean up the NA values for samples that were lost
+    # Replace NA in Sex column with "Unknown"
+    Final_Summary[is.na(Sex), Sex := "Unknown"]
+    
+
+    # Replace NA in numeric columns with 0
+    numeric_cols <- c("AMELX", "AMELY")
+    for (col in numeric_cols) {
+      if(col %in% names(Final_Summary)) {
+        set(Final_Summary, which(is.na(Final_Summary[[col]])), col, 0)
+      }
+    }
+    
+    return(Final_Summary)
   }
   
   
   #D. Plot the MS traces in tab 3 -  (fn1 = Peptide intensities data, fn2 = Experimental design, fn3 = Raw intensities data, x = replicate, y = Choice of the modeling strategy, a = max % of values to be removed) 
-  Plot_MSTraces <- function(fn1, fn2, fn3, x, y, a, dotProd, isoDotProd, peakRatio){ 
-    SUMMARY <- Sex_IDENTIFICATION(fn1, fn2, y, a, dotProd, isoDotProd, peakRatio)
+  Plot_MSTraces <- function(fn1, fn2, fn3, x, y, a, dotProd, isoDotProd, peakRatio, selectedPeptides, lod_coeff, loq_coeff){ 
+    SUMMARY <- Sex_IDENTIFICATION(fn1, fn2, y, a, dotProd, isoDotProd, peakRatio, selectedPeptides, lod_coeff, loq_coeff)
     Table <- fread(fn3)
     TableF <- Table[!grepl("precursor", Table$Transition),]
-    #Filter to only keep one sample
     Plot <- TableF[Replicate == x, ]
-    #Transform to long table
-    Plot_Long <- Plot %>%
-      separate_rows(`Raw Times`, `Raw Intensities`, sep = ",")
-    #Transform to numeric
+    Plot_Long <- Plot %>% separate_rows(`Raw Times`, `Raw Intensities`, sep = ",")
     Plot_Long$`Raw Times` <- as.numeric(Plot_Long$`Raw Times`)
     Plot_Long$`Raw Intensities` <- as.numeric(Plot_Long$`Raw Intensities`)
-    #Split the table per precursor to plot the MS2 traces per peptide
-    T1 <- Plot_Long[Plot_Long$`Modified Sequence` == "SIRPPYPSY", ]
-    p1 <- ggplot(T1, aes(x=`Raw Times`, y=`Raw Intensities`))+
-      geom_line(aes(color=Transition), size=0.6)+
-      theme_light()+
-      xlab("Time (min)")+
-      ylab("Intensity")+
-      ggtitle("AMELX-SIRPPYPSY")+
-      guides(color = guide_legend(title = "Fragment"))
     
-    T2 <- Plot_Long[Plot_Long$`Modified Sequence` == "SIRPPYPSYG", ]
-    p2 <- ggplot(T2, aes(x=`Raw Times`, y=`Raw Intensities`))+
-      geom_line(aes(color=Transition), size=0.6)+
-      theme_light()+
-      xlab("Time (min)")+
-      ylab("Intensity")+
-      ggtitle("AMELX-SIRPPYPSYG")+
-      guides(color = guide_legend(title = "Fragment"))
+    # List to hold the plots that will be generated
+    plots <- list()
     
-    T3 <- Plot_Long[Plot_Long$`Modified Sequence` == "SM[+16]IRPPYS", ]
-    p3 <- ggplot(T3, aes(x=`Raw Times`, y=`Raw Intensities`))+
-      geom_line(aes(color=Transition), size=0.6)+
-      theme_light()+
-      xlab("Time (min)")+
-      ylab("Intensity")+
-      ggtitle("AMELY-SM[+16]IRPPYS")+
-      guides(color = guide_legend(title = "Fragment"))
+    # Loop through the selected peptides and create a plot for each
+    for (peptide in selectedPeptides) {
+      T_data <- Plot_Long[Plot_Long$`Modified Sequence` == peptide, ]
+      
+      # Determine protein for title
+      protein_name <- if (grepl("SIR", peptide)) "AMELX" else "AMELY"
+      
+      p <- ggplot(T_data, aes(x=`Raw Times`, y=`Raw Intensities`))+
+        geom_line(aes(color=Transition), size=0.6)+
+        theme_light()+
+        xlab("Time (min)")+
+        ylab("Intensity")+
+        ggtitle(paste0(protein_name, "-", peptide))+
+        guides(color = guide_legend(title = "Fragment"))
+      
+      plots[[peptide]] <- p
+    }
     
-    T4 <- Plot_Long[Plot_Long$`Modified Sequence` == "SMIRPPY", ]
-    p4 <- ggplot(T4, aes(x=`Raw Times`, y=`Raw Intensities`))+
-      geom_line(aes(color=Transition), size=0.6)+
-      theme_light()+
-      xlab("Time (min)")+
-      ylab("Intensity")+
-      ggtitle("AMELY-SMIRPPY")+
-      guides(color = guide_legend(title = "Fragment"))
+    # Create the text label with the final result
+    result_text <- SUMMARY[SUMMARY$Sample == x, ]
+    result_text <- as.character(result_text[1,4])
+    p_text <- textGrob(result_text, gp = gpar(col = "black", fontsize = 40))
     
-    T5 <- Plot_Long[Plot_Long$`Modified Sequence` == "SM[+16]IRPPY", ]
-    p5 <- ggplot(T5, aes(x=`Raw Times`, y=`Raw Intensities`))+
-      geom_line(aes(color=Transition), size=0.6)+
-      theme_light()+
-      xlab("Time (min)")+
-      ylab("Intensity")+
-      ggtitle("AMELY-SM[+16]IRPPY")+
-      guides(color = guide_legend(title = "Fragment"))
+    # Add the text plot to the list of plots to be arranged
+    all_grobs <- c(list(p_text), plots)
     
-    p6 <- SUMMARY[SUMMARY$Sample == x, ]
-    p6 <- as.character(p6[1,4])
-    p6 <- textGrob(p6, gp = gpar(col = "black", fontsize = 40))
-    
-    print(grid.arrange(p6, p1, p2, p4, p5, p3, nrow = 2))
+    # Arrange all generated plots
+    if (length(all_grobs) > 1) { # Only try to arrange if there are plots to show
+      print(do.call(grid.arrange, c(all_grobs, nrow = 2)))
+    }
   }
 
   
@@ -673,41 +739,46 @@ server <- (function(input, output, session) {
   })
   
   x <- eventReactive(input$stdcurvesButton, {
-    req(input$table1, input$table2)
+    req(input$table1, input$table2, input$peptide_selection)
     PlotStdCurves(input$table1$datapath, input$table2$datapath, 
-                  input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
+                  input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio,
+                  input$peptide_selection, input$lod_coeff, input$loq_coeff)
   })
   
   v <- eventReactive(input$modelButton, {
-    req(input$table1, input$table2)
+    req(input$table1, input$table2, input$peptide_selection)
     Plot_Tab2(input$table1$datapath, input$table2$datapath, 
               input$model, input$outlier,
-              input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
+              input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio,
+              input$peptide_selection, input$lod_coeff, input$loq_coeff)
   })
   
   y <- eventReactive(input$sexidButton, {
-    req(input$table1, input$table2)
+    req(input$table1, input$table2, input$peptide_selection)
     Sex_IDENTIFICATION(input$table1$datapath, input$table2$datapath, 
                        input$model, input$outlier,
-                       input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
+                       input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio,
+                       input$peptide_selection, input$lod_coeff, input$loq_coeff)
   })
   
   output$download <- downloadHandler(
     filename = function() {"sex_identification_output.csv"},
     content = function(file) {
-      req(input$table1, input$table2)
+      req(input$table1, input$table2, input$peptide_selection)
       result <- Sex_IDENTIFICATION(input$table1$datapath, input$table2$datapath, 
                                    input$model, input$outlier,
-                                   input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
+                                   input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio,
+                                   input$peptide_selection, input$lod_coeff, input$loq_coeff)
       write.csv(result, file, row.names = FALSE)
     }
   )
   
   z <- eventReactive(input$tracesButton, {
-    req(input$table1, input$table2, input$skyline)
+    req(input$table1, input$table2, input$skyline, input$peptide_selection)
     Plot_MSTraces(input$table1$datapath, input$table2$datapath, input$skyline$datapath, 
                   input$samples, input$model, input$outlier,
-                  input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio)
+                  input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio,
+                  input$peptide_selection, input$lod_coeff, input$loq_coeff)
   })
   
   output$plot1 <- renderPlot({x()})
