@@ -91,6 +91,7 @@ ui <- fluidPage(
     wellPanel(
       tags$h4("Sex Identification"),
       actionButton("sexidButton", "Plot table"),
+      checkboxInput("include_peptide_details", "Include peptide-level quantifications in download", value = FALSE),
       downloadButton('download',"Download the data"),
     ),
     wellPanel(
@@ -387,8 +388,7 @@ server <- (function(input, output, session) {
       if (length(values) == 0 || all(is.na(values))) return(-Inf)
       max(values, na.rm = TRUE)
     }
-    print(Reg)
-    
+
     for (exp in unique(dt2$Experiment)) {
       Reg2 <- Reg[Reg$Experiment == exp, ]
       Table <- dt1[dt1$Experiment == exp, ]
@@ -403,11 +403,7 @@ server <- (function(input, output, session) {
       # Robustly find LOD and LOQ by peptide name
       LOD_AMELY_val <- safe_max(Reg2[Sequence %in% c("SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY"), LOD])
       LOQ_AMELY_val <- safe_max(Reg2[Sequence %in% c("SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY"), LOQ])
-      
-      print(Table)
-      print(paste("LOD AMELY:",LOD_AMELY_val))
-      print(paste("LOQ AMELY:",LOQ_AMELY_val))
-      
+
       # Apply the logic
       Table[, Females := fifelse(ThAMELY > log(LOQ_AMELY_val, 2) & AMELY_low > log(LOD_AMELY_val, 2), "Female", "NonConclusive")]
       ID <- rbind(ID, Table, fill = TRUE)
@@ -762,14 +758,66 @@ server <- (function(input, output, session) {
   })
   
   output$download <- downloadHandler(
-    filename = function() {"sex_identification_output.csv"},
+    filename = function() {
+      if (input$include_peptide_details) {
+        "sex_identification_detailed_output.csv"
+      } else {
+        "sex_identification_summary_output.csv"
+      }
+    },
     content = function(file) {
       req(input$table1, input$table2, input$peptide_selection)
-      result <- Sex_IDENTIFICATION(input$table1$datapath, input$table2$datapath, 
-                                   input$model, input$outlier,
-                                   input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio,
-                                   input$peptide_selection, input$lod_coeff, input$loq_coeff)
-      write.csv(result, file, row.names = FALSE)
+      
+      # Generate the final summary table first.
+      summary_result <- Sex_IDENTIFICATION(
+        input$table1$datapath, input$table2$datapath,
+        input$model, input$outlier,
+        input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio,
+        input$peptide_selection, input$lod_coeff, input$loq_coeff)
+      
+      # Check if the user wants detailed data
+      if (input$include_peptide_details) {
+        # Regenerate the intermediate wide-format table.
+        TableF <- Load_Filter(
+          input$table1$datapath, input$table2$datapath,
+          input$dotProduct, input$isotopeDotProduct, input$peakFoundRatio,
+          input$peptide_selection
+        )
+        STD <- STD_Table(TableF)
+        Reg <- STD_Regression(STD, input$lod_coeff, input$loq_coeff)
+        
+        # This intermediate table has the wide format with individual peptide columns
+        detailed_data <- Male_ID(TableF, Reg)
+        
+        # Rename 'Replicate' to 'Sample' to match the summary table for merging
+        setnames(detailed_data, "Replicate", "Sample")
+        
+        # Define all possible peptide columns
+        peptide_cols <- c("SIRPPYPSY", "SIRPPYPSYG", "SM[+16]IRPPY", "SM[+16]IRPPYS", "SMIRPPY")
+        # Find which of these are actually present in the current dataset
+        present_peptide_cols <- intersect(peptide_cols, names(detailed_data))
+        
+        # Select only the sample identifiers and the peptide columns for merging
+        detailed_data_subset <- detailed_data[, .SD, .SDcols = c("Sample", "Experiment", present_peptide_cols)]
+        
+        # Merge the final summary with the detailed peptide data
+        # Use all.x = TRUE to ensure all samples from the final summary are kept
+        final_table <- merge(summary_result, detailed_data_subset, by = c("Sample", "Experiment"), all.x = TRUE)
+        
+        # For samples that were lost during filtering, their peptide values will be NA after the merge.
+        # We replace these NAs with 0 for clarity.
+        for (col in present_peptide_cols) {
+          if (col %in% names(final_table)) {
+            set(final_table, which(is.na(final_table[[col]])), col, 0)
+          }
+        }
+        
+        write.csv(final_table, file, row.names = FALSE)
+        
+      } else {
+        # If the user does not want details, write the summary table as before
+        write.csv(summary_result, file, row.names = FALSE)
+      }
     }
   )
   
